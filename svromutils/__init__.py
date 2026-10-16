@@ -44,4 +44,5 @@ from svromutils.parameters import *
 from svromutils.io_0d import *
 from svromutils.io_1d import *
 from svromutils.io_headers import *
+from svromutils.slicer import *
 import vtk

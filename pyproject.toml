@@ -18,6 +18,10 @@ dependencies = [
     "vmtk>=1.5.2",
 ]
 
+[project.optional-dependencies]
+test = ["pytest"]
+
 [project.scripts]
 svromutils-create-solver-file="svromutils.create_solver_file:run_cli"
+svromutils-slice-results="svromutils.slicer:run_cli"
 
