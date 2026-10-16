@@ -64,8 +64,9 @@ logger = logging.getLogger(get_logger_name())
 PRESSURE_PREFIX = "pressure"
 VELOCITY_PREFIX = "velocity"
 
-# Prefixes of the centerline point data arrays copied to the output centerline.
-CENTERLINE_KEEP_PREFIXES = ["BifurcationId", "BifurcationIdTmp", "BranchId", "BranchIdTmp",
+# Prefixes (case-insensitive) of the centerline point data arrays copied to the output
+# centerline, e.g. "BranchId" also keeps "BranchIdTmp".
+CENTERLINE_KEEP_PREFIXES = ["BifurcationId", "BranchId",
     "CenterlineId", "CenterlineSectionArea", "CenterlineSectionBifurcation",
     "CenterlineSectionClosed", "CenterlineSectionMaxSize", "CenterlineSectionMinSize",
     "CenterlineSectionNormal", "CenterlineSectionRemove", "CenterlineSectionShape",
@@ -329,6 +330,7 @@ def slice_results(results, centerlines, num_workers=1):
             under the names of the pressure* and velocity* arrays.
     """
     slicer = _Slicer(results, centerlines)
+    logger.info("Mapping arrays: %s" % ", ".join(slicer.array_names))
     values = _slice_all(slicer, num_workers)
     return _output_centerlines(centerlines, slicer.array_names, values)
 
@@ -347,10 +349,7 @@ def slice_results_files(results_file, centerlines_file, output_file, num_workers
     logger.info("Reading centerlines file '%s'" % centerlines_file)
     centerlines = read_polydata(centerlines_file)
 
-    slicer = _Slicer(results, centerlines)
-    logger.info("Mapping arrays: %s" % ", ".join(slicer.array_names))
-    values = _slice_all(slicer, num_workers)
-    output = _output_centerlines(centerlines, slicer.array_names, values)
+    output = slice_results(results, centerlines, num_workers=num_workers)
 
     logger.info("Writing output file '%s'" % output_file)
     write_polydata(output_file, output)
