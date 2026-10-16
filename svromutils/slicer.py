@@ -72,6 +72,7 @@ CENTERLINE_KEEP_PREFIXES = ["BifurcationId", "BifurcationIdTmp", "BranchId", "Br
     "GlobalNodeId", "MaximumInscribedSphereRadius", "Path"]
 
 NORMAL_ARRAY = "CenterlineSectionNormal"
+BRANCH_ARRAY = "BranchId"
 
 # Weights used to move the slice plane toward the neighboring centerline point when
 # the plane at the centerline point does not cut the mesh.
@@ -111,24 +112,48 @@ class _Slicer(object):
         _keep_arrays(self.mesh.GetPointData(), [PRESSURE_PREFIX, VELOCITY_PREFIX])
         self.mesh.GetCellData().Initialize()
 
+        # Skip arrays that only share a prefix with the results, e.g. a scalar velocity_magnitude.
         point_data = self.mesh.GetPointData()
-        self.array_names = [point_data.GetArrayName(i) for i in range(point_data.GetNumberOfArrays())]
-        for name in self.array_names:
+        self.array_names = []
+        for name in [point_data.GetArrayName(i) for i in range(point_data.GetNumberOfArrays())]:
             num_comp = point_data.GetArray(name).GetNumberOfComponents()
-            if _starts_with(name, VELOCITY_PREFIX) and num_comp != 3:
-                raise RuntimeError("Velocity array '%s' has %d components, expected 3." % (name, num_comp))
-            if _starts_with(name, PRESSURE_PREFIX) and num_comp != 1:
-                raise RuntimeError("Pressure array '%s' has %d components, expected 1." % (name, num_comp))
+            expected = 3 if _starts_with(name, VELOCITY_PREFIX) else 1
+            if num_comp != expected:
+                logger.warning("Skipping array '%s' with %d components, expected %d." % (name, num_comp, expected))
+                point_data.RemoveArray(name)
+            else:
+                self.array_names.append(name)
 
         if centerlines.GetPointData().GetArray(NORMAL_ARRAY) is None:
             raise RuntimeError("The centerlines do not have a '%s' point data array." % NORMAL_ARRAY)
         self.positions = v2n(centerlines.GetPoints().GetData()).astype(float)
         self.normals = v2n(centerlines.GetPointData().GetArray(NORMAL_ARRAY)).astype(float)
+        zero_normals = np.flatnonzero(np.linalg.norm(self.normals, axis=1) == 0.0)
+        if len(zero_normals) > 0:
+            raise RuntimeError("The '%s' array is zero at centerline point %d." % (NORMAL_ARRAY, zero_normals[0]))
+
+        branch_ids = centerlines.GetPointData().GetArray(BRANCH_ARRAY)
+        self.branch_ids = None if branch_ids is None else v2n(branch_ids)
+
+        self.neighbors = [set() for _ in self.positions]
+        lines = centerlines.GetLines()
+        point_ids = vtk.vtkIdList()
+        lines.InitTraversal()
+        while lines.GetNextCell(point_ids):
+            for i in range(1, point_ids.GetNumberOfIds()):
+                start = point_ids.GetId(i - 1)
+                end = point_ids.GetId(i)
+                if start != end:
+                    self.neighbors[start].add(end)
+                    self.neighbors[end].add(start)
 
     def _extract_slice(self, position, normal):
-        """ Extract the slice at a position, or None if the plane does not cut the mesh.
+        """ Extract the slice at a position, or None if it has no positive area.
 
         Only the connected part of the slice closest to the position is returned.
+
+        Returns:
+            tuple: The triangulated slice, its triangles' point IDs and their areas.
         """
         plane = vtk.vtkPlane()
         plane.SetOrigin(position)
@@ -149,16 +174,54 @@ class _Slicer(object):
         conn_filter.SetExtractionModeToClosestPointRegion()
         conn_filter.SetClosestPoint(position)
         conn_filter.Update()
-        return conn_filter.GetOutput()
+        slice_data = conn_filter.GetOutput()
+        polys = slice_data.GetPolys()
+        if polys.GetNumberOfCells() == 0:
+            return None
+
+        if np.any(np.diff(v2n(polys.GetOffsetsArray())) != 3):
+            triangle_filter = vtk.vtkTriangleFilter()
+            triangle_filter.SetInputData(slice_data)
+            triangle_filter.Update()
+            slice_data = triangle_filter.GetOutput()
+            polys = slice_data.GetPolys()
+
+        # Degenerate cells, e.g. of a flat mesh element, can give polygons without area.
+        triangles = v2n(polys.GetConnectivityArray()).reshape(-1, 3)
+        points = v2n(slice_data.GetPoints().GetData()).astype(float)
+        p0, p1, p2 = (points[triangles[:, i]] for i in range(3))
+        areas = 0.5 * np.linalg.norm(np.cross(p1 - p0, p2 - p0), axis=1)
+        if not areas.sum() > 0.0:
+            return None
+        return slice_data, triangles, areas
 
     def _neighbor(self, index):
-        """ Get the index of the neighboring centerline point closest to a point.
+        """ Get the index of the closest directly connected centerline point.
+
+        Connected points at the same position are skipped and their own neighbors are
+        used instead. If the centerlines have a BranchId array, points on the same branch
+        are preferred so the plane is not moved into another branch at a bifurcation.
         """
-        candidates = [i for i in (index + 1, index - 1) if 0 <= i < len(self.positions)]
+        position = self.positions[index]
+        coincident = {index}
+        candidates = set()
+        stack = [index]
+        while stack:
+            for i in self.neighbors[stack.pop()]:
+                if i in coincident or i in candidates:
+                    continue
+                if np.array_equal(self.positions[i], position):
+                    coincident.add(i)
+                    stack.append(i)
+                else:
+                    candidates.add(i)
         if not candidates:
             return None
-        dists = [np.sum((self.positions[i] - self.positions[index])**2) for i in candidates]
-        return candidates[int(np.argmin(dists))]
+
+        def key(i):
+            other_branch = self.branch_ids is not None and self.branch_ids[i] != self.branch_ids[index]
+            return (other_branch, np.sum((self.positions[i] - position)**2), i)
+        return min(candidates, key=key)
 
     def slice_point(self, index):
         """ Compute the integrated quantities for a centerline point.
@@ -170,6 +233,11 @@ class _Slicer(object):
         position1 = self.positions[index]
         normal1 = self.normals[index]
         neighbor = self._neighbor(index)
+        if neighbor is not None:
+            # Orient the neighbor's normal like this point's so the blended normal is not zero.
+            normal2 = self.normals[neighbor]
+            if np.dot(normal1, normal2) < 0.0:
+                normal2 = -normal2
 
         slice_data = None
         for weight in NEIGHBOR_WEIGHTS:
@@ -179,7 +247,7 @@ class _Slicer(object):
                 break
             else:
                 position = (1.0 - weight) * position1 + weight * self.positions[neighbor]
-                normal = (1.0 - weight) * normal1 + weight * self.normals[neighbor]
+                normal = (1.0 - weight) * normal1 + weight * normal2
             normal = normal / np.linalg.norm(normal)
             slice_data = self._extract_slice(position, normal)
             if slice_data is not None:
@@ -189,30 +257,15 @@ class _Slicer(object):
         if slice_data is None:
             raise RuntimeError("Could not extract a slice at centerline point %d." % index)
 
-        return self._integrate(slice_data, normal)
+        return self._integrate(*slice_data, normal)
 
-    def _integrate(self, slice_data, normal):
+    def _integrate(self, slice_data, triangles, areas, normal):
         """ Integrate the point data arrays of a slice.
 
         Point values are linearly interpolated over each triangle, so the integral over
         a triangle is its area times the mean of its point values.
         """
-        polys = slice_data.GetPolys()
-        if polys.GetNumberOfCells() == 0:
-            raise RuntimeError("The slice has no polygons.")
-        if np.any(np.diff(v2n(polys.GetOffsetsArray())) != 3):
-            triangle_filter = vtk.vtkTriangleFilter()
-            triangle_filter.SetInputData(slice_data)
-            triangle_filter.Update()
-            slice_data = triangle_filter.GetOutput()
-            polys = slice_data.GetPolys()
-
-        triangles = v2n(polys.GetConnectivityArray()).reshape(-1, 3)
-        points = v2n(slice_data.GetPoints().GetData()).astype(float)
-        p0, p1, p2 = (points[triangles[:, i]] for i in range(3))
-        areas = 0.5 * np.linalg.norm(np.cross(p1 - p0, p2 - p0), axis=1)
         total_area = areas.sum()
-
         values = {}
         point_data = slice_data.GetPointData()
         for name in self.array_names:
